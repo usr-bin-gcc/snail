@@ -1,0 +1,1053 @@
+/*******************************************************************************
+
+File        : snail.c
+
+Date        : Sunday 6th March 2022
+
+Author      : Steve Gilbert and Gavin Cawley
+
+Description : Desktop silly.
+
+              Major updates for 2^5th anniversary edition:
+
+              (a) Snail now drawn in a (transparent) window, so the WIMP 
+                  deals with redrawing the background.  This also gives 
+                  somewhat more flicker-free sprite animation.
+                           
+              (b) Animation now uses an alarm timer for consistent speed.
+
+              (c) Works correctly in all modes, with any colour depth.
+
+              (d) Reacts appropriately to mode changes.
+
+              (e) Monitors the background and maintains a pixel-by-pixel
+                  record of the background under the snail's path, the last 
+                  time each pixel was visible.
+                           
+              (f) Snail window always redrawn at the bottom of the window
+                  stack, to simplify background handling.  
+
+              (g) Multiple snails with random speeds.
+
+History     : 10/09/1990 - v1.0.0 initial version by SG
+              06/03/2022 - v2.0.0 updated by GCC
+
+*******************************************************************************/
+
+
+#include "bbc.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "res.h"
+#include "resspr.h"
+#include "menu.h"
+#include "template.h"
+#include "dbox.h"
+#include "werr.h"
+#include "heap.h"
+#include "flex.h"
+#include "sprite.h"
+#include "alarm.h"
+#include "colourtran.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+// #define DEBUG
+
+#include "logger.h"
+
+
+/******************************************************************************
+*                                                                             *
+*                                   CONSTANTS                                 *
+*                                                                             *
+******************************************************************************/
+
+                                
+// SWI numbers
+
+#define OS_SpriteOp             0x2E
+#define OS_File                 0x08
+#define OS_SetColour            0x61
+#define Wimp_ForceRedraw        0x400D1
+#define ColourTrans_SelectTable 0x40740
+
+// Menu entries
+
+#define iconmenu_MInfo      1
+#define iconmenu_MFreeze    2
+#define iconmenu_MQuit      3
+
+#define snail_info_field    3
+
+// snail sprite info
+
+#define SpriteWidth  104
+#define SpriteHeight 50
+#define SpriteMode   15
+#define SNAIL_Y      136
+
+
+/******************************************************************************
+*                                                                             *
+*                              DATA STRUCTURES                                *
+*                                                                             *
+******************************************************************************/                                         
+
+typedef struct
+{
+   sprite_area *area;
+   
+   sprite_id id;
+} 
+sprDetails;
+
+typedef struct
+{                 
+   sprite_area *area;
+
+   int size;   // current size of the sprite area 
+
+   sprite_id background, buffer;
+
+   int *context;
+
+   // background/buffer window for debugging
+
+   BOOL visible;
+
+   wimp_w handle;   
+}
+Background;
+
+typedef struct
+{               
+   int mode;
+   int dx;
+   int dy;
+   int bpp;
+   int x;
+   int y;
+
+   sprite_factors sfactors;
+
+   wimp_paletteword palette[256];
+}
+ModeInfo;
+
+typedef struct SnailStr
+{               
+   // positions and speed in 24.8 fixed point format 
+
+   int x, y;          
+
+   int speed;   
+
+   wimp_w handle;
+
+   struct SnailStr *next;
+}
+Snail;
+                                                                                           
+/******************************************************************************
+*                                                                             *
+*                                 GLOBAL DATA                                 *
+*                                                                             *
+******************************************************************************/
+
+
+static char *snail_Version_String = "v2.0.0 (06/03/2022)";
+
+static BOOL frozen = FALSE;
+
+sprDetails mySprite;
+
+Background background;
+
+ModeInfo modeInfo;
+
+Snail *first = NULL;
+
+
+/******************************************************************************
+*                                                                             *
+*                              FORWARD DECLARATIONS                           *
+*                                                                             *
+******************************************************************************/
+                                                   
+
+void plotSprite(char* spr, int x, int y, int ymag);
+
+static void snail_open_window(wimp_openstr *o);
+
+static void snail_event_handler(wimp_eventstr *e, void *handle);
+
+                                                                               
+/******************************************************************************
+*                                                                             *
+*                             BACKGROUND MONITORING                           *
+*                                                                             *
+******************************************************************************/
+            
+                  
+void forceRedraw(wimp_w handle)
+{                                               
+   os_regset regs; 
+
+   regs.r[0] = handle; 
+   regs.r[1] = 0x4B534154;   // "TASK"
+
+   wimpt_complain(os_swix(Wimp_ForceRedraw, &regs)); 
+} 
+
+#ifdef DEBUG
+
+void background_updateWindow(void)
+{
+   // update snail window
+                              
+   BOOL more;
+
+   wimp_redrawstr redrawstr;
+                    
+   redrawstr.w      = background.handle;
+   redrawstr.box.x0 = -4096;           
+   redrawstr.box.y0 = -4096;
+   redrawstr.box.x1 = +4090;
+   redrawstr.box.y1 = +4096;
+      
+   wimpt_complain(wimp_update_wind(&redrawstr, &more));
+
+   while (more)
+   {
+      // screen co-ordinates of the work area origin
+                                                          
+      int x = redrawstr.box.x0 - redrawstr.scx;
+      int y = redrawstr.box.y1 - redrawstr.scy;
+
+      // redraw buffer used for monitoring              
+
+      os_regset regs; 
+
+      regs.r[0] = 52 + 512;                     
+      regs.r[1] = (int)background.area;
+      regs.r[2] = (int)background.buffer.s.addr;
+      regs.r[3] = x;
+      regs.r[4] = y + 16;
+      regs.r[5] = 0x8;
+      regs.r[6] = 0;
+      regs.r[7] = 0;    
+
+      wimpt_complain(os_swix(OS_SpriteOp, &regs)); 
+
+      // redraw background
+
+      sprite_put_given(background.area, &background.background, 0, x, 
+         y + 132);
+
+      wimp_get_rectangle(&redrawstr, &more);
+   }  
+}
+
+void background_redrawWindow(void)
+{                                                                      
+   BOOL more;                    
+
+   wimp_redrawstr redrawstr;
+
+   // ignore the redraw request rectangle and update the whole window
+
+   redrawstr.w = background.handle;
+
+   wimpt_noerr(wimp_redraw_wind(&redrawstr, &more));   
+            
+   while(more)
+   {           
+      // screen co-ordinates of the work area origin
+                                                          
+      int x = redrawstr.box.x0 - redrawstr.scx;
+      int y = redrawstr.box.y1 - redrawstr.scy;
+                       
+      // redraw buffer used for monitoring              
+
+      os_regset regs; 
+
+      regs.r[0] = 52 + 512;                     
+      regs.r[1] = (int)background.area;
+      regs.r[2] = (int)background.buffer.s.addr;
+      regs.r[3] = x;
+      regs.r[4] = y + 16;
+      regs.r[5] = 0x8;
+      regs.r[6] = 0 ; // (int)&sfactors;  
+      regs.r[7] = 0;    
+
+      wimpt_complain(os_swix(OS_SpriteOp, &regs)); 
+
+      // redraw background
+
+      sprite_put_given(background.area, &background.background, 0, x, 
+         y + 132);
+
+      // get next rectangle to be redrawn           
+
+      wimp_get_rectangle(&redrawstr, &more);
+   }     
+}
+                                           
+void background_openWindow(wimp_openstr *openstr) 
+{
+   wimpt_noerr(wimp_open_wind(openstr));
+}
+
+void background_eventHandler(wimp_eventstr *e, void *handle)
+{
+   switch (e->e)
+   {
+      case wimp_EREDRAW:
+      {
+         background_redrawWindow();
+      
+         break;
+      }
+      case wimp_EOPEN:
+      {
+         background_openWindow(&e->data.o);
+                            
+         background.visible = TRUE;  
+
+         break;
+      }
+      case wimp_ECLOSE:
+      {
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+      
+         background.visible = FALSE;
+
+         break;
+      }
+   }
+}     
+   
+void background_updateWindowExtent(void)
+{ 
+   wimp_wstate wstate;                 
+
+   wimpt_complain(wimp_get_wind_state(background.handle, &wstate));
+
+   wstate.o.w      = background.handle;
+   wstate.o.box.x0 = 0;
+   wstate.o.box.y0 = 0;
+   wstate.o.box.x1 = modeInfo.x;
+   wstate.o.box.y1 = 100+32+100+16;  
+                   
+   wimp_set_extent((wimp_redrawstr*)&wstate.o); 
+}       
+ 
+#endif
+           
+/*******************************************************************************
+
+Function    : intersects
+
+Parameters  : wimp_box - pointer to bounding box of first window
+              wimp_box - pointer to bounding box of second window
+
+Returns     : BOOL - TRUE if boxes intersect and FALSE otherwise
+
+Description : Determine whether one window overlaps another on-screen.
+
+*******************************************************************************/
+
+BOOL intersects(wimp_box *x, wimp_box *y)
+{                          
+   if (x->x0 > y->x1) return FALSE;
+   if (x->x1 < y->x0) return FALSE;
+   if (x->y0 > y->y1) return FALSE;
+   if (x->y1 < y->y0) return FALSE; 
+   
+   return TRUE;
+}
+                                               
+void background_monitor(void)
+{
+   // get the current background
+
+   sprite_get_given_rp(background.area, "buffer", (sprite_palflag)0, 
+      0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, 
+      &background.buffer.s.addr);
+
+   background.buffer.tag = sprite_id_addr;
+
+   wimpt_complain(sprite_create_mask(background.area, 
+                     &background.buffer));
+                                        
+   // change context to the mask of the buffer sprite
+
+   sprite_state sstate;
+
+   wimpt_noerr(sprite_outputtomask(background.area, &background.buffer, 
+                  background.context, &sstate));
+                                        
+   // reopen the snail window at the bottom of the window stack
+
+   wimp_wstate wstate;
+
+   wimpt_complain(wimp_get_wind_state(first->handle, &wstate));  
+
+   snail_open_window(&wstate.o);
+
+   // go through the window stack to find overlapping (non-snail) windows
+                                   
+   int gcol;
+
+   wimp_paletteword entry;
+
+   entry.word = 0x00000000;
+
+   colourtran_setGCOL(entry, 0, 0, &gcol);
+     
+   wimp_box box;
+
+   box.x0 = 0;
+   box.x1 = modeInfo.x;
+   box.y0 = SNAIL_Y - 40;
+   box.y1 = SNAIL_Y + 40 + 100;
+                                        
+   wstate.o.behind = first->handle;
+
+   do
+   {                                   
+      wimpt_complain(wimp_get_wind_state(wstate.o.behind, &wstate));      
+
+      if (intersects(&box, &wstate.o.box)) 
+      {
+         // account for any window furniture the window may have
+
+         wstate.o.box.y1 += (wstate.flags & wimp_WTITLE) ? 40 : 0;
+         wstate.o.box.y0 -= (wstate.flags & wimp_WHSCR)  ? 42 : 2;
+         wstate.o.box.x1 += (wstate.flags & wimp_WVSCR)  ? 40 : 0;
+         wstate.o.box.x0 -= 1;
+
+         // mask of buffer sprite behind overlapping window
+                                 
+         bbc_rectanglefill(wstate.o.box.x0, 
+                           wstate.o.box.y0 - SNAIL_Y, 
+                           wstate.o.box.x1 - wstate.o.box.x0, 
+                           wstate.o.box.y1 - wstate.o.box.y0);   
+      }
+   }
+   while (wstate.o.behind != -1);                               
+  
+   // return to the previous context
+
+   sprite_restorestate(sstate); 
+
+   // change context to the background sprite
+
+   wimpt_noerr(sprite_outputtosprite(background.area, &background.background, 
+                  background.context, &sstate));
+
+   // update background        
+
+   os_regset regs; 
+
+   regs.r[0] = 34 + 512;                     
+   regs.r[1] = (int)background.area;
+   regs.r[2] = (int)background.buffer.s.addr;
+   regs.r[3] = 0;
+   regs.r[4] = 0;
+   regs.r[5] = 0x8; 
+
+   wimpt_complain(os_swix(OS_SpriteOp, &regs)); 
+
+   // return to the previous context
+
+   sprite_restorestate(sstate);           
+
+#ifdef DEBUG                             
+      
+   background_updateWindow();   
+   forceRedraw(background.handle);
+
+#endif
+}                                                           
+
+int minWords(int bytes)
+{
+   return (bytes + 0x3) & ~0x3;
+}
+
+void background_init(void)
+{                                          
+   // create sprite area          
+
+   int width   = modeInfo.x >> modeInfo.dx;
+   int height  = 100        >> modeInfo.dy;
+   int mbpp    = 1;
+
+   if ((modeInfo.mode < 256) || (modeInfo.mode & 0x80000000))
+   {
+      mbpp = modeInfo.bpp;
+   }
+                                           
+   background.size = sizeof(sprite_area)
+                   + sizeof(sprite_header)
+                   + height*minWords(1+width*modeInfo.bpp/8)
+                   + sizeof(sprite_header)
+                   + height*minWords(1+width*modeInfo.bpp/8)
+                   + height*minWords(1+width*mbpp/8);
+                                                                   
+   background.area = (sprite_area*)heap_alloc(background.size);
+  
+   sprite_area_initialise(background.area, background.size);
+
+   // create sprite to record the current background 
+
+   background.background.tag = sprite_id_addr;
+
+   sprite_get_given_rp(background.area, "background", (sprite_palflag)0, 
+      0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, &background.background.s.addr);        
+                                                             
+   // create buffer for smooth sprite ploting
+
+   background.buffer.tag = sprite_id_addr;  
+
+   sprite_get_given_rp(background.area, "buffer", (sprite_palflag)0, 
+      0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, &background.buffer.s.addr);  
+
+   // create area to save graphics context when using the buffer
+
+   os_regset regs; 
+
+   regs.r[0] = 62;       
+   regs.r[1] = (int)background.area;
+   regs.r[2] = 0;
+
+   wimpt_complain(os_swix(OS_SpriteOp, &regs));   
+                        
+   background.context    = malloc(regs.r[3]);
+   background.context[0] = 0;                  
+      
+#ifdef DEBUG
+
+   // create background monitor window  
+
+   wimp_wind *wind = template_syshandle("Background");
+
+   wimpt_complain(wimp_create_wind(wind, &background.handle));
+
+   win_register_event_handler(background.handle, background_eventHandler, 
+      NULL);
+
+   background_updateWindowExtent();
+
+   wimp_wstate wstate;
+      
+   if (wimpt_complain(wimp_get_wind_state(background.handle, &wstate)) == 0)
+   {                     
+      wstate.o.behind = -1;
+         
+      wimpt_noerr(wimp_open_wind(&wstate.o));
+         
+      background.visible = TRUE;
+   }   
+
+#endif
+}
+
+void background_modeChanged(void)
+{                     
+   heap_free(background.area);
+
+   free(background.context);
+
+   background_init();
+}
+                                                                               
+
+/******************************************************************************
+*                                                                             *
+*                              WINDOW FUNCTIONS                               *
+*                                                                             *
+******************************************************************************/
+
+
+static void snail_redraw_window(wimp_w handle)
+{
+   BOOL more;
+
+   wimp_redrawstr redrawstr;
+                                  
+   redrawstr.w = handle;
+
+   wimpt_noerr(wimp_redraw_wind(&redrawstr, &more));   
+            
+   while(more)
+   {                                                                     
+      int y = redrawstr.box.y1 - redrawstr.scy;          
+  
+      sprite_put_given(background.area, &background.buffer, 0, 0, y-100); 
+
+      wimp_get_rectangle(&redrawstr, &more);
+   }     
+}
+
+static void snail_open_window(wimp_openstr *o)
+{
+   // ensure window is re-opened at the bottom of the window stack
+
+   o->behind = -2;
+
+   wimpt_noerr(wimp_open_wind(o));
+}
+    
+static Snail* snail_new(void)
+{
+   Snail* snail = (Snail*)malloc(sizeof(Snail));
+                                                    
+   snail->x     = modeInfo.x << 7;
+   snail->y     = 136 << 8;
+   snail->speed = 128 + rand()%768;
+   snail->next  = NULL;
+  
+   // create window
+
+   wimp_wind *window;
+    
+   window = template_syshandle("MainWindow");
+    
+   if (window == 0)
+   {
+      // To do: complain
+   }
+
+   // make window border transparent
+
+   window->colours[0] = 0xFF;
+
+   wimpt_complain(wimp_create_wind(window, &snail->handle)); 
+
+   // register event handler for this window
+
+   win_register_event_handler(snail->handle, snail_event_handler, snail);
+
+   // new snail ready
+
+   return snail;
+}                                                                           
+
+
+/******************************************************************************
+*                                                                             *
+*                                  APPLCATION                                 *
+*                                                                             *
+******************************************************************************/
+
+
+void updateSnail(void *handle)
+{                                             
+   background_monitor();
+
+   if (frozen == FALSE && first != NULL)
+   {           
+      for (Snail* snail = first; snail != NULL; snail = snail->next)
+      {
+         snail->x -= snail->speed;
+      
+         if ((snail->x >> 8) < -150)
+         {
+            snail->x = (modeInfo.x + 150) << 8;
+         } 
+
+         if ((snail->x >>8) > modeInfo.x + 150)
+         {
+            snail->x = (modeInfo.x + 150) << 8;
+         }
+      }
+       
+      // prepare sprite for this time step
+
+      sprite_state sstate;
+
+      os_error *err = sprite_outputtosprite(background.area, 
+                         &background.buffer, background.context, &sstate); 
+                                              
+      if (err)
+      {
+         LOG(__func__, "%s generated error number %d - '%s'", 
+            "sprite_outputtosprite", err->errnum, err->errmess);
+      }
+
+      // copy background into buffer  
+      
+      sprite_put_given(background.area, &background.background, 0, 0, 0);       
+    
+      // plot snail sprites over the background in the buffer
+
+      mySprite.id.tag = sprite_id_name;    
+                                                             
+      for (Snail* snail = first; snail != NULL; snail = snail->next)
+      {                                   
+         int x = snail->x >> 8;
+
+         if (((x*x*4) % 512) < 255)
+         { 
+            mySprite.id.s.name = "snail1m";
+         }
+         else
+         {
+            mySprite.id.s.name = "snail2m";
+         }                                 
+  
+         sprite_put_scaled(mySprite.area, &mySprite.id, 8, x, 0, 
+            &modeInfo.sfactors, (sprite_pixtrans*)modeInfo.palette);
+      }
+
+      // draw appropriate snail over background in the buffer
+
+      sprite_restorestate(sstate);
+                 
+      // update snail windows
+
+      for (Snail* snail = first; snail != NULL; snail = snail->next)
+      {  
+         // reopen snail window in new position, at the bottom of the stack
+
+         wimp_openstr openstr;
+         
+         openstr.w      = snail->handle;
+         openstr.box.x0 = snail->x >> 8;
+         openstr.box.y0 = (snail->y >> 8) + 1;
+         openstr.box.x1 = openstr.box.x0 + 103;
+         openstr.box.y1 = openstr.box.y0 + 99;
+         openstr.behind = -2;   
+
+         wimpt_noerr(wimp_open_wind(&openstr));               
+                     
+         // update snail window
+                              
+         BOOL more;
+
+         wimp_redrawstr redrawstr;
+                    
+         redrawstr.w      = snail->handle;
+         redrawstr.box.x0 = -4096;           
+         redrawstr.box.y0 = -4096;
+         redrawstr.box.x1 = +4090;
+         redrawstr.box.y1 = +4096;
+      
+         wimpt_complain(wimp_update_wind(&redrawstr, &more));
+
+         while (more)
+         {
+            // screen co-ordinates of the work area origin
+                                                          
+            int y = redrawstr.box.y1 - redrawstr.scy;          
+
+            sprite_put_given(background.area, &background.buffer, 0, 0, y-100); 
+
+            wimp_get_rectangle(&redrawstr, &more);
+         }  
+      }                                          
+
+      // reset alarm for 1/25th of a second later
+          
+      if (!frozen)
+      {
+         alarm_set(alarm_timenow() + 4, (alarm_handler)updateSnail, NULL); 
+      }
+   }
+}
+
+/******************************************************************************
+*                                                                             *
+*                               EVENT HANDLERS                                *
+*                                                                             *
+******************************************************************************/
+
+void snail_iconclick(wimp_i icon)
+{
+   icon = icon;
+
+   // create a new snail and append to snail list
+       
+   Snail* snail = snail_new();                   
+
+   if (first == NULL)
+   {
+      first = snail;
+   }             
+   else
+   {
+      for (Snail* s = first; s != NULL; s = s->next)
+      {
+         if (s->next == NULL)
+         {
+            s->next = snail;
+
+            break;
+         }
+      }
+   }                  
+
+   snail->next = NULL;
+
+   // open snail window on screen at the bottom of the window stack
+                                             
+   wimp_wstate wstate;
+
+   wimpt_complain(wimp_get_wind_state(snail->handle, &wstate));
+
+   wstate.o.behind = -2;
+   wstate.o.box.x0 = snail->x >> 8;
+   wstate.o.box.y0 = (snail->y >> 8) + 1;
+   wstate.o.box.x1 = wstate.o.box.x0 + 103;
+   wstate.o.box.y1 = wstate.o.box.y0 + 99;
+
+   wimpt_noerr(wimp_open_wind(&wstate.o));
+
+   if (frozen)
+   {
+      frozen = FALSE;
+
+      alarm_set(alarm_timenow() + 4, (alarm_handler)updateSnail, NULL);
+   }
+}
+
+static void snail_info_about_program(void)
+{
+   dbox  d;
+
+   if (d = dbox_new("ProgInfo"), d != NULL)
+   {
+      dbox_setfield(d, snail_info_field, snail_Version_String);
+      dbox_show(d);
+      dbox_fillin(d);
+      dbox_dispose(&d);
+   }
+}
+
+static void snail_menuproc(void *handle, char *hit)
+{
+   handle = handle;
+
+   switch (hit[0])
+   {
+      case iconmenu_MInfo:
+      {
+         snail_info_about_program();
+ 
+         break;             
+      }
+      case iconmenu_MFreeze:
+      {
+         if (frozen)
+         {
+             frozen = FALSE;
+
+             alarm_set(alarm_timenow() + 1, (alarm_handler)updateSnail, NULL);
+          }
+          else
+          {
+             frozen = TRUE;
+          }
+
+          break;
+      }
+      case iconmenu_MQuit:
+      {
+         exit(0);
+      }
+   }
+}
+
+static void snail_event_handler(wimp_eventstr *e, void *handle)
+{
+   handle = handle;
+
+   switch (e->e)
+   {
+      case wimp_EREDRAW:
+      {
+         snail_redraw_window(e->data.o.w);
+      
+         break;
+      }
+      case wimp_EOPEN:
+      {
+         snail_open_window(&e->data.o);
+      
+         break;
+      }
+      case wimp_ECLOSE:
+      {
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+      
+         break;
+      }
+   }
+}   
+      
+
+/******************************************************************************
+*                                                                             *
+*                                MENU HANDLING                                *
+*                                                                             *
+******************************************************************************/
+
+
+static menu snail_menumaker(void *handle)
+{
+   menu temp;
+
+   handle = handle;
+
+   temp = menu_new("Snail", ">Info,Freeze,Quit");
+  
+   menu_setflags(temp, iconmenu_MFreeze,(frozen == TRUE)? 1 : 0, 0);
+  
+   return temp;
+}                            
+
+void getModeInfo(void)
+{               
+   int dummy;
+                                         
+   (void)os_byte(135, &dummy, &modeInfo.mode);
+
+   modeInfo.dx  = bbc_vduvar(bbc_XEigFactor);
+   modeInfo.dy  = bbc_vduvar(bbc_YEigFactor);
+   modeInfo.bpp = 1 << bbc_vduvar(bbc_Log2BPP);
+   modeInfo.x   = 1 +  bbc_vduvar(bbc_XWindLimit);
+   modeInfo.y   = 1 +  bbc_vduvar(bbc_YWindLimit);
+
+   LOG(__func__, "mode = %#x (%d)", modeInfo.mode);
+   LOG(__func__, "bpp  = %d", modeInfo.bpp);
+   LOG(__func__, "x    = %d", modeInfo.x);
+   LOG(__func__, "y    = %d", modeInfo.y);
+   LOG(__func__, "dx   = %d", modeInfo.dx);
+   LOG(__func__, "dy   = %d", modeInfo.dy);
+
+   modeInfo.x <<= modeInfo.dx;
+   modeInfo.y <<= modeInfo.dy;
+
+   // set up palette for this mode               
+
+   colourtran_select_table(15, 0, -1, (void*)-1, &modeInfo.palette);
+                                                              
+   // set up snail sprite scaling factors for this mode
+
+   modeInfo.sfactors.xmag = modeInfo.dx ? 1 : 2;
+   modeInfo.sfactors.ymag = modeInfo.dy ? 2 : 4;
+   modeInfo.sfactors.xdiv = modeInfo.dx ? (1 << (modeInfo.dx - 1)) : 1;
+   modeInfo.sfactors.ydiv = modeInfo.dx ? (1 << (modeInfo.dy - 1)) : 1;
+}
+
+BOOL messageEventProcessor(wimp_eventstr *e, void *handle)
+{
+   switch (e->e)
+   {
+      case wimp_ESEND: 
+      case wimp_ESENDWANTACK:
+      {
+         switch (e->data.msg.hdr.action)
+         {
+            case wimp_MMODECHANGE:
+            {        
+               getModeInfo();
+
+               background_modeChanged();
+
+               return TRUE;
+            }
+         }
+
+         return FALSE;
+      }
+   }
+
+   return FALSE;
+}
+
+/******************************************************************************
+*                                                                             *
+*                                INITIALISATION                               *
+*                                                                             *
+******************************************************************************/
+
+
+
+static BOOL snail_initialise(void)
+{
+
+   flex_init();
+   heap_init(FALSE);
+   wimpt_init("snail");
+   res_init("snail");
+   resspr_init();
+   template_init();
+   dbox_init();      
+   alarm_init();
+
+   getModeInfo();
+
+   background_init();
+
+   win_add_unknown_event_processor(messageEventProcessor, NULL);
+
+   baricon("!snail", (int)resspr_area(), snail_iconclick);
+  
+   event_attachmenumaker(win_ICONBAR, snail_menumaker, snail_menuproc, 0);
+
+   // load snail sprites 
+
+   char* filename = "<Snail$Dir>.Sprites";
+
+   os_regset regs;
+
+   regs.r[0] = 17; 
+   regs.r[1] = (int)filename;
+
+   wimpt_complain(os_swix(OS_File, &regs));
+
+   int size = regs.r[4] + 4;
+
+   mySprite.area = (sprite_area*)heap_alloc(size);
+  
+   sprite_area_initialise(mySprite.area, size);
+
+   sprite_area_load(mySprite.area, filename);
+
+   frozen = TRUE;
+
+   return TRUE;
+}
+
+/******************************************************************************
+*                                                                             *
+*                                MAIN PROGRAM                                 *
+*                                                                             *
+******************************************************************************/
+
+int main(void)
+{
+   if (snail_initialise())
+   {
+      event_setmask((wimp_emask)(wimp_EMPTRENTER | wimp_EMPTRLEAVE));
+    
+      while (TRUE)
+      {
+         event_process();
+      }
+   }
+
+   return EXIT_SUCCESS;
+}
+
+
+/*****************************************************************************/

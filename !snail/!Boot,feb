@@ -1,0 +1,6 @@
+| boot file for wexample application
+
+Set <Snail$Dir>  <Obey$Dir>
+Set <Snail$Path> <Obey$Dir>.
+Iconsprites <Obey$Dir>.!Sprites
+

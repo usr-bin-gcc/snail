@@ -1,0 +1,34 @@
+# Project:   snail
+
+
+# Toolflags:
+CCflags = -c -IRISC_OSLib: -throwback -I<Logger$Dir>
+C++flags = -c -IRISC_OSLib: -throwback -I<Logger$Dir>
+Linkflags = -aif -c++ -o $@
+ObjAsmflags = -throwback -NoCache 
+CMHGflags = 
+LibFileflags = -c -o $@
+Squeezeflags = -o $@
+ModSqzflags = -o $@
+
+OBJS = @.o.snail @.o.logger RISC_OSLib:o.risc_oslib C:o.stubs 
+
+# Final targets:
+@.snail: $(OBJS)
+        Link $(Linkflags) $(OBJS)
+
+
+.INIT:
+        @CDir o
+
+# User-editable dependencies:
+
+# Static dependencies:
+
+@.o.snail:  @.c.snail <Logger$Dir>.h.logger
+        cc $(ccflags) -o @.o.snail @.c.snail 
+
+@.o.logger: <Logger$Dir>.h.logger <Logger$Dir>.c.logger
+        cc $(ccflags) -o @.o.logger <Logger$Dir>.c.logger 
+
+
