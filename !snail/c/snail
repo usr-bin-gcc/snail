@@ -2,7 +2,7 @@
 
 File        : snail.c
 
-Date        : Sunday 6th March 2022
+Date        : Sunday 11th March 2022
 
 Author      : Steve Gilbert and Gavin Cawley
 
@@ -30,7 +30,7 @@ Description : Desktop silly.
               (g) Multiple snails with random speeds.
 
 History     : 10/09/1990 - v1.0.0 initial version by SG
-              06/03/2022 - v2.0.0 updated by GCC
+              11/03/2022 - v2.0.0 updated by GCC
 
 *******************************************************************************/
 
@@ -57,9 +57,11 @@ History     : 10/09/1990 - v1.0.0 initial version by SG
 #include <stdio.h>
 #include <string.h>
 
-// #define DEBUG
-
+#ifdef DEBUG
 #include "logger.h"
+#else
+#define LOG(...) {}
+#endif
 
 
 /******************************************************************************
