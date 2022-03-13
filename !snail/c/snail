@@ -2,7 +2,7 @@
 
 File        : snail.c
 
-Date        : Sunday 11th March 2022
+Date        : Sunday 13th March 2022
 
 Author      : Steve Gilbert and Gavin Cawley
 
@@ -31,6 +31,8 @@ Description : Desktop silly.
 
 History     : 10/09/1990 - v1.0.0 initial version by SG
               11/03/2022 - v2.0.0 updated by GCC
+              13/03/2022 - v2.1.0 fixed bug relating to sprite mode on 3.7
+                                  and modified to use flex.
 
 *******************************************************************************/
 
@@ -58,11 +60,12 @@ History     : 10/09/1990 - v1.0.0 initial version by SG
 #include <string.h>
 
 #ifdef DEBUG
-#include "logger.h"
+#include "log.h"
 #else
-#define LOG(...) {}
+#define LOG(...)
+#define LOG_PREAMBLE         
+#define LOG_SPRITE(...)
 #endif
-
 
 /******************************************************************************
 *                                                                             *
@@ -163,7 +166,7 @@ Snail;
 ******************************************************************************/
 
 
-static char *snail_Version_String = "v2.0.0 (06/03/2022)";
+static char *snail_Version_String = "v2.1.0 (13/03/2022)";
 
 static BOOL frozen = FALSE;
 
@@ -492,35 +495,58 @@ void background_init(void)
    int height  = 100        >> modeInfo.dy;
    int mbpp    = 1;
 
-   if ((modeInfo.mode < 256) || (modeInfo.mode & 0x80000000))
-   {
-      mbpp = modeInfo.bpp;
-   }
-                                           
+   // assume 1 bpp mask
+                                        
    background.size = sizeof(sprite_area)
                    + sizeof(sprite_header)
                    + height*minWords(1+width*modeInfo.bpp/8)
                    + sizeof(sprite_header)
                    + height*minWords(1+width*modeInfo.bpp/8)
                    + height*minWords(1+width*mbpp/8);
+
+   LOG_PREAMBLE;
+   LOG("size = %d", background.size);
                                                                    
-   background.area = (sprite_area*)heap_alloc(background.size);
+   flex_alloc((flex_ptr)&background.area, background.size);
   
-   sprite_area_initialise(background.area, background.size);
+   sprite_area_initialise(background.area, background.size); 
 
    // create sprite to record the current background 
 
    background.background.tag = sprite_id_addr;
 
-   sprite_get_given_rp(background.area, "background", (sprite_palflag)0, 
-      0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, &background.background.s.addr);        
-                                                             
+   wimpt_complain(sprite_get_given_rp(background.area, "background", 
+                     (sprite_palflag)0, 0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, 
+                     &background.background.s.addr));
+
+   LOG_SPRITE(background.background.s.addr); 
+
+   // extend sprite area if 8bpp sprites required
+
+   sprite_header* header = (sprite_header*)background.background.s.addr;
+
+   if (header->mode < 256)
+   {
+      background.size += height*minWords(1+width*7/8);                                     
+      flex_extend((flex_ptr)&background.area, background.size);
+                                                                   
+      background.area->size = background.size;
+
+      LOG("reallocating sprite area (size = %d)", background.size);
+   }
+                             
    // create buffer for smooth sprite ploting
 
    background.buffer.tag = sprite_id_addr;  
 
-   sprite_get_given_rp(background.area, "buffer", (sprite_palflag)0, 
-      0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, &background.buffer.s.addr);  
+   wimpt_complain(sprite_get_given_rp(background.area, "buffer", 
+                     (sprite_palflag)0, 0, SNAIL_Y, modeInfo.x, SNAIL_Y+99, 
+                     &background.buffer.s.addr));  
+
+   wimpt_complain(sprite_create_mask(background.area, 
+                     &background.buffer));
+
+   LOG_SPRITE(background.buffer.s.addr);  
 
    // create area to save graphics context when using the buffer
 
@@ -564,7 +590,7 @@ void background_init(void)
 
 void background_modeChanged(void)
 {                     
-   heap_free(background.area);
+   flex_free((flex_ptr)&background.area);
 
    free(background.context);
 
@@ -681,7 +707,8 @@ void updateSnail(void *handle)
                                               
       if (err)
       {
-         LOG(__func__, "%s generated error number %d - '%s'", 
+         LOG_PREAMBLE;
+         LOG("%s generated error number %d - '%s'", 
             "sprite_outputtosprite", err->errnum, err->errmess);
       }
 
@@ -928,12 +955,12 @@ void getModeInfo(void)
    modeInfo.x   = 1 +  bbc_vduvar(bbc_XWindLimit);
    modeInfo.y   = 1 +  bbc_vduvar(bbc_YWindLimit);
 
-   LOG(__func__, "mode = %#x (%d)", modeInfo.mode);
-   LOG(__func__, "bpp  = %d", modeInfo.bpp);
-   LOG(__func__, "x    = %d", modeInfo.x);
-   LOG(__func__, "y    = %d", modeInfo.y);
-   LOG(__func__, "dx   = %d", modeInfo.dx);
-   LOG(__func__, "dy   = %d", modeInfo.dy);
+   LOG_PREAMBLE;
+   LOG("   mode = %#010x (%d)\n   bpp  = %d\n"
+       "   x    = %d\n   y    = %d\n"
+       "   dx   = %d\n   dy   = %d", 
+       modeInfo.mode, modeInfo.mode, modeInfo.bpp, 
+       modeInfo.x,  modeInfo.y, modeInfo.dx, modeInfo.dy);
 
    modeInfo.x <<= modeInfo.dx;
    modeInfo.y <<= modeInfo.dy;

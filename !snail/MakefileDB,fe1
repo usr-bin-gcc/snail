@@ -2,8 +2,8 @@
 
 
 # Toolflags:
-CCflags = -c -IRISC_OSLib: -throwback -I<Logger$Dir>
-C++flags = -c -IRISC_OSLib: -throwback -I<Logger$Dir>
+CCflags = -c -IRISC_OSLib: -throwback -I<Log$Dir> -D DEBUG
+C++flags = -c -IRISC_OSLib: -throwback -I<Log$Dir>
 Linkflags = -aif -c++ -o $@
 ObjAsmflags = -throwback -NoCache 
 CMHGflags = 
@@ -11,7 +11,7 @@ LibFileflags = -c -o $@
 Squeezeflags = -o $@
 ModSqzflags = -o $@
 
-OBJS = @.o.snail @.o.logger RISC_OSLib:o.risc_oslib C:o.stubs 
+OBJS = @.o.snail @.o.log RISC_OSLib:o.risc_oslib C:o.stubs 
 
 # Final targets:
 @.snail: $(OBJS)
@@ -25,10 +25,10 @@ OBJS = @.o.snail @.o.logger RISC_OSLib:o.risc_oslib C:o.stubs
 
 # Static dependencies:
 
-@.o.snail:  @.c.snail <Logger$Dir>.h.logger
+@.o.snail:  @.c.snail <Log$Dir>.h.log
         cc $(ccflags) -o @.o.snail @.c.snail 
 
-@.o.logger: <Logger$Dir>.h.logger <Logger$Dir>.c.logger
-        cc $(ccflags) -o @.o.logger <Logger$Dir>.c.logger 
+@.o.log: <Log$Dir>.h.log <Log$Dir>.c.log
+        cc $(ccflags) -o @.o.log <Log$Dir>.c.log
 
 
